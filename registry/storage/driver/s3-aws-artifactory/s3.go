@@ -12,16 +12,15 @@
 package s3artifactory
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -118,7 +117,7 @@ type DriverParameters struct {
 	SessionToken                string
 	UseDualStack                bool
 	Accelerate                  bool
-	ArtifactoryMetadata         string
+	MetadataPath                string
 }
 
 func init() {
@@ -168,7 +167,7 @@ type driver struct {
 	RootDirectory               string
 	StorageClass                string
 	ObjectACL                   string
-	ArtifactoryMetadata         string
+	ArtifactoryMetadata         map[string]string
 }
 
 type baseEmbed struct {
@@ -439,7 +438,12 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	default:
 		return nil, fmt.Errorf("the accelerate parameter should be a boolean")
 	}
-	artyMeta := parameters["artifactory_metadata"]
+	artyMeta := fmt.Sprintf("%s", parameters["metadatapath"])
+	if parameters["rootdirectory"] == "" {
+		if strings.HasPrefix(artyMeta, "../") {
+			return nil, fmt.Errorf("metadata path cant have relative path if rootdirectory is not set")
+		}
+	}
 
 	params := DriverParameters{
 		fmt.Sprint(accessKey),
@@ -572,6 +576,7 @@ func New(params DriverParameters) (*Driver, error) {
 	// 	}
 	// }
 
+	metaData := make(map[string]string)
 	d := &driver{
 		S3:                          s3obj,
 		Bucket:                      params.Bucket,
@@ -585,9 +590,17 @@ func New(params DriverParameters) (*Driver, error) {
 		RootDirectory:               params.RootDirectory,
 		StorageClass:                params.StorageClass,
 		ObjectACL:                   params.ObjectACL,
-		ArtifactoryMetadata:         params.ArtifactoryMetadata,
 	}
-
+	mPath := params.RootDirectory + params.MetadataPath
+	content, err := d.GetContent(context.TODO(), mPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read metadata from path: %s: %s", mPath, err)
+	}
+	err = json.Unmarshal(content, &metaData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal metadata: %s", err)
+	}
+	d.ArtifactoryMetadata = metaData
 	return &Driver{
 		baseEmbed: baseEmbed{
 			Base: base.Base{
@@ -608,21 +621,12 @@ func sha1path(s string) string {
 }
 
 func (d *driver) ConvertPath(p string) (string, error) {
+	if !strings.HasPrefix(p, "/docker/registry") {
+		return p, nil
+	}
 	// artifactory doesn't have docker/registry/v2/repositories path
 	sPath := strings.TrimPrefix(p, "/docker/registry/v2")
-	file, err := os.Open(d.ArtifactoryMetadata)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	fileMap := make(map[string]string)
-	for scanner.Scan() {
-		line := scanner.Text()
-		path := strings.Split(line, ":")
-		fileMap[path[0]] = path[1]
-	}
-	return fmt.Sprintf("/%s", sha1path(fileMap[sPath])), nil
+	return fmt.Sprintf("/%s", sha1path(d.ArtifactoryMetadata[sPath])), nil
 }
 
 func handleLink(s string) string {
@@ -631,10 +635,9 @@ func handleLink(s string) string {
 
 // GetContent retrieves the content stored at "path" as a []byte.
 func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
-	fmt.Printf("AAA %s\n", path)
 	// /docker/registry/v2/repositories/bks-docker-local/cert-manager-controller/_manifests/tags/v0.12.0-venafi/current/link
 	nPath, err := d.ConvertPath(path)
-	// /bks-docker-local/cert-manager-controller/_manifests/tags/v0.12.0-venafi/current/link 
+	// /bks-docker-local/cert-manager-controller/_manifests/tags/v0.12.0-venafi/current/link
 	if strings.HasSuffix(path, "link") {
 		// return digest for manifest "sha256:xxxxxx"
 		digest := fmt.Sprintf("sha256:%s", strings.Split(nPath, "/")[2])
@@ -647,8 +650,6 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	bytes, _ := io.ReadAll(reader)
-	fmt.Printf("Foo: %+v\n", string(bytes))
 	return io.ReadAll(reader)
 }
 
@@ -664,7 +665,6 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("Reader: path with d.s3Path %s\n", d.s3Path(path))
 	resp, err := d.S3.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(d.Bucket),
 		Key:    aws.String(d.s3Path(path)),
@@ -689,9 +689,7 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 // Stat retrieves the FileInfo for the given path, including the current size
 // in bytes and the creation time.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
-	fmt.Printf("Stat here: %s\n", path)
-	path,err := d.ConvertPath(path)
-	fmt.Printf("Stat converted path: %s\n", d.s3Path(path))
+	path, err := d.ConvertPath(path)
 	if err != nil {
 		return nil, err
 	}
@@ -727,7 +725,6 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 
 // List returns a list of the objects that are direct descendants of the given path.
 func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
-	fmt.Printf("List here: %s\n", opath)
 	path := opath
 	if path != "/" && path[len(path)-1] != '/' {
 		path = path + "/"
@@ -806,12 +803,10 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 // URLFor returns a URL which may be used to retrieve the content stored at the given path.
 // May return an UnsupportedMethodErr in certain StorageDriver implementations.
 func (d *driver) URLFor(ctx context.Context, path string, options map[string]interface{}) (string, error) {
-	fmt.Printf("URLFor here: %s\n", path)
 	path, err := d.ConvertPath(path)
 	if err != nil {
 		return "", err
 	}
-	fmt.Printf("URLFor path after convert: %s\n", path)
 	methodString := http.MethodGet
 	method, ok := options["method"]
 	if ok {
@@ -853,7 +848,6 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 // Walk traverses a filesystem defined within driver, starting
 // from the given path, calling f on each file
 func (d *driver) Walk(ctx context.Context, from string, f storagedriver.WalkFn, options ...func(*storagedriver.WalkOptions)) error {
-	fmt.Printf("Walk here: %s\n", from)
 	walkOptions := &storagedriver.WalkOptions{}
 	for _, o := range options {
 		o(walkOptions)
@@ -868,7 +862,6 @@ func (d *driver) Walk(ctx context.Context, from string, f storagedriver.WalkFn, 
 }
 
 func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, from string, startAfter string, f storagedriver.WalkFn) error {
-	fmt.Printf("doWalk here: %s\n", from)
 	var (
 		retError error
 		// the most recent directory walked for de-duping
